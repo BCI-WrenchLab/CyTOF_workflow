@@ -1,0 +1,789 @@
+---
+title: "CyTOF workflow"
+output: html_notebook
+editor_options: 
+  chunk_output_type: inline
+---
+
+Initialise packages
+```{r}
+#BiocManager::install(c("CATALYST","flowCore","cowplot","tidyverse","SingleCellExperiment","flowDensity","CytoNorm"))
+packages <- c("CATALYST","flowCore","cowplot","tidyverse","SingleCellExperiment",
+              "readxl","flowDensity","CytoNorm","cyCombine","diffcyt")
+invisible(lapply(packages, library, character.only = TRUE))
+```
+Read in fcs files as flowCore flowSet
+```{r}
+donors <- c("07","09","12","13")
+fcs_dirname <- "final_run_batches"
+fcs_dir <- file.path(getwd(),fcs_dirname)
+debar_gated_dir <- "final_run_norm_debar_fcs"
+sample_key <- read.csv("CD45_12_plex_key.csv")
+colnames(sample_key) <- as.numeric(c(89, 110, 111, 112, 114, 116))
+rownames(sample_key) <- LETTERS[1:12]
+
+for (i in seq_along(donors)){
+donor <- donors[i]
+fcs_data <- read.flowSet(path = fcs_dir,
+                         pattern = paste0("*",donor,".fcs",sep=""),
+                         transformation = NULL,
+                         emptyValue = FALSE)
+sce <- prepData(fcs_data)
+
+
+####Normalise and remove beads with CATALYST
+
+res <- normCytof(sce, beads = c(89,115,140,159,175,209), k = 50, 
+  assays = c("counts", "exprs"), overwrite = FALSE)
+n <- ncol(sce); ns <- c(ncol(res$beads), ncol(res$removed))
+data.frame(
+    check.names = FALSE, 
+    "#" = c(ns[1], ns[2]), 
+    "%" = 100*c(ns[1]/n, ns[2]/n),
+    row.names = c("beads", "removed"))
+
+
+####Extract normalised events
+
+sce <- res$data
+assayNames(sce)
+
+
+####REFINE: Use flowAI and flowcut to clean flow rate and signal
+
+#not sure if can be done in sce object
+
+
+####Preliminary debarcoding
+(sce <- assignPrelim(sce, sample_key))
+
+
+####Refine debarcoding
+
+sce <- estCutoffs(sce)
+metadata(sce)$sep_cutoffs
+
+sce <- applyCutoffs(sce, sep_cutoffs = min(metadata(sce)$sep_cutoffs))
+
+
+####Convert barcoded data to flowSet
+
+sce <- sce[, sce$bc_id != 0]
+debar_fs <- sce2fcs(sce, split_by = "bc_id")
+
+
+####Gate down to live singlets
+
+fs_gated <- fsApply(debar_fs, intact_singlet_live_cells, ff_name = pData(debar_fs)$name)
+
+#REFINE: montage all plots for QC purposes
+
+####Save gated flow set and remove from workspace
+write.flowSet(fs_gated, outdir = file.path(getwd(), debar_gated_dir, paste0("LC",donor,"_processed", sep = "")))
+rm(fs_gated, sce)
+}
+
+```
+Reorganise the outputted fcs files
+```{r}
+proj_dir <- "C:/Users/micha/OneDrive/Documents/R/Projects/2023_03___CyTOF"
+indiv_donor_dirs <- list.dirs(path = debar_gated_dir, recursive = FALSE)
+#rename files
+for (i in seq_along(indiv_donor_dirs)){
+  indiv_dir <- indiv_donor_dirs[i]
+  setwd(file.path(proj_dir,indiv_dir))
+  file.rename(list.files(file.path(proj_dir,indiv_dir), pattern="*.fcs"),
+              gsub(".*fcs/","",
+                   list.files(file.path(proj_dir,indiv_dir),
+                              pattern = "*.fcs", full.names = TRUE)) %>% str_replace("processed/",""))
+  setwd(proj_dir)
+}
+setwd(file.path(proj_dir))
+
+#put all files into a single directory
+file.copy(from=list.files(path = debar_gated_dir, pattern = "*.fcs", recursive = TRUE, full.names = TRUE),
+          to="combined_batches")
+```
+
+
+Do cyCombine batch correction
+```{r}
+#library(cyCombine)
+#
+#batch_panel_file <- read_excel("panel_batch_combine.xlsx")
+#batch_metadata_file <- read_excel("metadat_batch_combine.xlsx")
+#
+# Extract markers of interest
+#markers <- batch_panel_file %>% 
+#  filter(Type != "none") %>% 
+#  pull(Antigen)
+
+# Prepare a tibble from directory of FCS files
+#uncorrected <- prepare_data(data_dir = "final_run_norm_debar_fcs",
+#                             markers = markers,
+#                             metadata = batch_metadata_file,
+#                             panel = batch_panel_file,
+#                             sample_ids = "Filename",
+#                             batch_ids = "batch",
+#                             filename_col = "Filename",
+#                             condition = "condition",
+#                             anchor = "anchor",
+#                             panel_channel = "Channel",
+#                             panel_antigen = "Antigen",
+#                             down_sample = TRUE,
+#                             sample_size = 500000,
+#                             seed = 473,
+#                             cofactor = 5) 
+#
+#detect_batch_effect_express(uncorrected, downsample = 10000, out_dir = 'batch_effect_check')
+#
+#corrected <- uncorrected %>%
+#  batch_correct(covar = "condition",
+#                xdim = 8,
+#                ydim = 8,
+#                norm_method = 'scale',
+#                markers = markers)
+```
+
+Reload as sce object with metadata and panel info
+```{r}
+panel <- read_excel("panel.xlsx")
+all_files_dir <- "combined_batches"
+
+#change panel so downstream clustering not done on cisplatin or DNA
+
+md <- read_excel("metadat_batch_combine.xlsx")
+md$condition <- factor(md$condition, levels = c("a0_NT","a0_CAR","a1_NT","a1_CAR"))
+md$sample_id <- factor(md$sample_id, 
+    levels = md$sample_id[order(md$condition)])
+sce <- prepData(file.path(proj_dir,all_files_dir), panel, md, features = panel$fcs_colname)
+```
+
+OR_load gated fcs files for CART data set
+```{r}
+panel <- read_excel("panel.xlsx")
+gated_files_dir <- "new_gated_CAR_from_boolean"
+
+#change panel so downstream clustering not done on cisplatin or DNA
+
+md <- read_excel("metadat_batch_combine.xlsx")
+md$condition <- factor(md$condition, levels = c("a0_NT","a0_CAR","a1_NT","a1_CAR"))
+md$sample_id <- factor(md$sample_id, 
+    levels = md$sample_id[order(md$condition)])
+sce_gated <- prepData(file.path(proj_dir,gated_files_dir), panel, md, features = panel$fcs_colname)
+```
+
+
+Scan expression values per condition
+```{r}
+p <- plotExprs(sce_gated, color_by = "condition")
+p$facet$params$ncol <- 6
+```
+
+Multi-dimensional scaling plot
+```{r}
+pbMDS(sce_gated, color_by = "condition", label_by = "sample_id")
+
+```
+
+Heatmap
+```{r}
+plotExprHeatmap(sce, scale = "last",
+    hm_pal = rev(hcl.colors(10, "YlGnBu")), show_row_names = FALSE)
+```
+
+Do initial overclustering with FlowSOM and then recluster up to max 20 clusters with ConcensusClusterPLus - all in cluster() wrapper from CATALYST
+```{r}
+#Initial clustering with assigment of 100SOM clusters to up to 20 metaclusters
+set.seed(1234)
+sce <- cluster(sce, features = rownames(sce)[rownames(sce) %in% c("CD3", "CD4", "CD8a", "CD10", "CD19", "c-Myc")],
+    xdim = 10, ydim = 10, maxK = 20, seed = 1234)
+
+#Heatmap of expression per cluster
+plotExprHeatmap(sce, features = rownames(sce)[rownames(sce) %in% c("CD3", "CD4", "CD8a", "CD10", "CD19", "c-Myc")], 
+    by = "cluster_id", k = "meta5", 
+    bars = TRUE, perc = TRUE)
+
+#annotate 5 canonical cell clusters
+meta5_annot <- c("B_cell", "CD4_NT", "CD4_CAR", "CD8_CAR", "CD8_NT")
+merging_big_5 <- data.frame(c(1:5), factor(meta5_annot, levels = meta5_annot))
+colnames(merging_big_5) <- c("original_cluster", "new_cluster")
+sce <- mergeClusters(sce, k = "meta5", table = merging_big_5, id = "merged_canonical", overwrite = TRUE)
+
+#Heatmap of expression per cluster after renaming
+plotExprHeatmap(sce, features = rownames(sce)[rownames(sce) %in% c("CD3", "CD4", "CD8a", "CD10", "CD19", "c-Myc")], 
+    by = "cluster_id", k = "merged_canonical", 
+    bars = TRUE, perc = TRUE)
+
+#Visualise with unap
+set.seed(1234)
+sce <- runDR(sce, "UMAP", cells = 1e3, features = rownames(sce_CART)[panel$marker_class != "none"])
+
+#facet umaps by condition
+plotDR(sce, "UMAP", color_by = "merged_canonical", facet_by = "condition")
+
+```
+
+Generate CAR-T only sce
+```{r}
+CART_dir <- "CART_fcs"
+panel <- read_excel("panel.xlsx")
+
+md_CART <- read_excel("CART_metadat_batch_combine.xlsx")
+md_CART$condition <- factor(md_CART$condition, levels = c("a0_CAR","a1_CAR"))
+md_CART$sample_id <- factor(md_CART$sample_id, 
+    levels = md_CART$sample_id)
+sce_CART <- prepData(file.path(proj_dir,CART_dir), panel, md_CART, features = panel$fcs_colname)
+sce_CART <- sce_CART[,assay(sce_CART, "exprs")["c-Myc",]>1.875]
+#recount numbers of cells
+sample_id_names <- as.vector(metadata(sce_CART)$experiment_info$sample_id)
+for(i in seq_along(sample_id_names)){
+  metadata(sce_CART)$experiment_info$n_cells[i] <-
+    sum(sce_CART$sample_id == as.vector(metadata(sce_CART)$experiment_info$sample_id[i]))
+}
+
+#p <- plotExprs(sce_CART, color_by = "condition")
+#p$facet$params$ncol <- 6
+
+#pbMDS(sce_CART, color_by = "condition", label_by = "sample_id")
+
+```
+
+Exploration CAR-T only data
+```{r}
+#sce_CART <- sce_gated
+#Initial clustering with assigment of 100SOM clusters to up to 20 metaclusters
+CART_diff_set <- c(5,6,7,9,10,12,13,17,19,21,24,27)
+set.seed(1234)
+sce_ctrl <- cluster(sce_ctrl, features = rownames(sce_CART)[CART_diff_set],
+    xdim = 10, ydim = 10, maxK = 20, seed = 1234)
+
+```
+
+Visualisation CAR-T only data
+```{r}
+#Heatmap of expression per cluster
+plotExprHeatmap(sce_ctrl, features = rownames(sce_CART)[CART_diff_set], 
+    by = "cluster_id", k = "meta6", 
+    bars = TRUE, perc = TRUE)
+
+#Visualise with umap
+set.seed(1234)
+sce_gated <- runDR(sce_gated, "UMAP", cells = 1e3, features = rownames(sce_gated)[CART_diff_set])
+
+#facet umaps by condition
+plotDR(sce_ctrl, "UMAP", color_by = "meta6", facet_by = "condition")
+```
+
+Annotate clusters
+```{r}
+new_clusters <- c("CD8-EM", "CD8-EFF", "Noise", "CD4-EFF", "CD8-CM", "CD8-SCM-like", "CD4-EM", "CD4-CM-like")
+meta8_annotate <- data.frame(c(1:8), factor(new_clusters)) %>%
+  setNames(c("original_cluster","new_cluster"))
+
+sce_ctrl <- mergeClusters(sce_ctrl, k = "meta8", table = meta8_annotate, id = "new_id")
+
+```
+
+Look at diff abundancies in CART only
+```{r}
+plotAbundances(sce_ctrl, k = "new_id", by = "cluster_id", shape_by = "patient_id")
+
+
+
+```
+
+DA of general protein expression in CART only
+```{r}
+sce_CART_overall_DE <- sce_CART
+sce_CART_overall_DE <- mergeClusters(sce_CART_overall_DE, k = "meta20", id = "merging_all",
+                                     table = data.frame(old_cluster = seq_len(20), new_cluster = "all"))
+
+p <- plotMedExprs(sce_CART_overall_DE, features = rownames(sce_CART_overall_DE)[panel$marker_class != "none"],
+                  shape_by = "patient_id")
+p$facet$params$ncol <- 8
+
+ei <- metadata(sce_CART_overall_DE)$experiment_info
+ei$batch <- rep(c(1,2), each = 12)
+
+design_mat <- createDesignMatrix(ei, cols_design = c("condition", "batch"))
+
+contrast_mat <- createContrast(c(0, 1, 0)) # this contrast sepcifies preADI_CAR vs ctrl_CAR
+block <- factor(ei$patient_id) # makes a pairwise comparison between individual donors 
+
+rowData(sce_CART_overall_DE)$marker_class <- factor(c(rep("state",31), rep("none",4)))
+ds_res_limma <- diffcyt(
+  sce_CART_overall_DE,
+  design = design_mat,
+  contrast =  contrast_mat,
+  analysis_type = "DS",
+  clustering_to_use = "merging_all",
+  verbose = TRUE,
+  block_id = block,
+)
+
+#sample_reorder <- paste0(rep(c("LC07","LC09","LC12","LC13"), each = 6),
+#                         rep("_", each = 24),
+#                         rep(c(LETTERS[4:6],LETTERS[7:9]), times=4),
+#                         sep="")
+
+```
+
+Plot single protein expression per cluster
+```{r}
+p <- plotMultiHeatmap(sce_CART, 
+    hm1 = rownames(sce_CART)[CART_diff_set], hm2 = "TRAIL", k = "meta9", 
+    row_anno = FALSE, bars = TRUE, perc = TRUE, normalize = FALSE)
+
+```
+
+
+Analyse differential protein expression between a0_CAR and a1_CAR
+```{r}
+#subset sce to include only control conditions
+ctrl_conditions <- c("a0_CAR","a1_CAR")
+sce_ctrl <- sce_gated[,colData(sce_gated)$condition %in% ctrl_conditions]
+#filter metadata$experiment_info
+metadata(sce_ctrl)$experiment_info <- metadata(sce_ctrl)$experiment_info[metadata(sce_ctrl)$experiment_info$condition %in%
+                                                ctrl_conditions,]
+#recount cells
+sample_id_names_ctrl <- as.vector(metadata(sce_ctrl)$experiment_info$sample_id)
+for(i in seq_along(sample_id_names)){
+  metadata(sce_ctrl)$experiment_info$n_cells[i] <-
+    sum(sce_ctrl$sample_id == as.vector(metadata(sce_ctrl)$experiment_info$sample_id[i]))
+}
+
+ei_ctrl <- metadata(sce_ctrl)$experiment_info %>%
+  mutate_all(factor) #refactors all levels to remove filtered out conditions and samples
+ei_ctrl$batch <- rep(c(1,2), each = 12)
+
+design_mat_ctrl <- createDesignMatrix(ei_ctrl, cols_design = c("condition", "batch"))
+
+contrast_mat_ctrl <- createContrast(c(0, 1, 0))
+block_ctrl <- factor(ei_ctrl$patient_id) # makes a pairwise comparison between individual donors 
+
+#reorder levels of sampl_ids to make HM look nice
+sample_reorder <- paste0(rep(c("LC07","LC09","LC12","LC13"), each = 6),
+                         rep("_", each = 24),
+                         rep(c(LETTERS[4:6],LETTERS[7:9]), times=4),
+                         sep="")
+colData(sce_ctrl)$sample_id <- factor(colData(sce_ctrl)$sample_id, levels = sample_reorder)
+
+ds_res_limma_ctrl <- diffcyt(
+  sce_ctrl,
+  design = design_mat_ctrl,
+  contrast =  contrast_mat_ctrl,
+  analysis_type = "DS",
+  clustering_to_use = "new_id",
+  verbose = TRUE,
+  block_id = block_ctrl,
+)
+
+da_res_limma_ctrl <- diffcyt(
+  sce_ctrl,
+  design = design_mat_ctrl,
+  contrast =  contrast_mat_ctrl,
+  analysis_type = "DA",
+  clustering_to_use = "new_id",
+  verbose = TRUE,
+  block_id = block_ctrl,
+)
+
+
+#rowData(ds_res_limma_ctrl$res)[rowData(ds_res_limma_ctrl$res)$ID == "1",] %>% data.frame() %>% arrange(p_adj, decreasing = FALSE)
+# plotExprHeatmap(sce_ctrl, features = rownames(sce_CART)[CART_diff_set], 
+#                 by = "cluster_id", k = "meta6", 
+#                 bars = TRUE, perc = TRUE)
+
+#plotDiffHeatmap(sce_ctrl, rowData(ds_res_limma_ctrl$res)[rowData(ds_res_limma_ctrl$res)$cluster_id %in% c("CD4-EFF", "CD4-EM", "CD4-CM-like") & rowData(ds_res_limma_ctrl$res)$p_adj < 0.05,], top_n = 50, fdr = FDR_cutoff, all = TRUE, sort_by = "lfc")
+```
+
+
+
+Per-cluster Differential analysis of sce
+```{r}
+FDR_cutoff <- 0.05
+
+ei_sce <- metadata(sce)$experiment_info
+ei_sce$preADI <- rep(c(0,1), each = 6, times = 4)
+ei_sce$Tcell <- rep(c("NT", "CAR", "CAR", "NT"), each = 3, times = 4)
+ei_sce$batch <- rep(c(0,1), each = 24)
+
+design_mat_sce <- createDesignMatrix(ei_sce, cols_design = c("preADI", "Tcell", "batch"))
+contrast_mat_sce <- createContrast(c(0, 1, 0, 0))
+block_sce <- factor(ei_sce$patient_id)
+
+marker_state_store <- rowData(sce)$marker_class
+rowData(sce)$marker_class <- factor(c(rep("state",31), rep("none",4)))
+
+sce_ds_res_limma <- diffcyt(
+  sce,
+  design = design_mat_sce,
+  contrast =  contrast_mat_sce,
+  analysis_type = "DS",
+  clustering_to_use = "merged_canonical",
+  verbose = TRUE,
+  block_id = block_sce,
+)
+
+```
+
+Volcano plot
+```{r}
+topTab <- rowData(ds_res_limma_ctrl$res)[!rowData(ds_res_limma_ctrl$res)$marker_id %in% c("CD10","CD19","c-Myc"),]
+EV <- EnhancedVolcano::EnhancedVolcano(topTab,
+                      x = "logFC",
+                      y = "p_adj",
+                      lab = topTab$marker_id,
+                      xlim = c(-1.5, 0.5), ylim = c(0,22.5),
+                      FCcutoff = 0,
+                      legendPosition = '',
+                      boxedLabels = TRUE,
+                      caption = '',
+                      col = c('grey','grey','grey','red3'),
+                      drawConnectors = TRUE)
+
+
+
+
+
+                
+
+
+
+```
+
+
+
+%%%%%%%%%%%%%%%%Functions from Computational and Structural Biotechnology Journal
+Volume 19, 2021, Pages 3160-3175
+Computational and Structural Biotechnology Journal
+Database Article
+Data processing workflow for large-scale immune monitoring studies by mass cytometry
+Author links open overlay panelPaulina Rybakowska et al
+%%%%%%%%%%%%%%%%
+```{r}
+#' gate_intact_cells
+#' 
+#' @description Performs gating of intact cells using flowDensity package
+#'
+#' @param flow_frame Character, full path to fcs_file.
+#' @param file_name Character, the file name used only for plotting, if NULL
+#' the file name stored in keyword GUID.original will be used, default is set to NULL
+#' @param tinypeak_removal1 numeric from 0-1, as in deGate to exclude/include 
+#' tiny peaks in the head of the density distribution curve for both Iridium 
+#' channels
+#' @param tinypeak_removal2 the same as tinypeak_removal1 but for the tail 
+#' in the density distribution curve
+#' @param alpha1 numeric, 0-1, as in deGate specify the significance of change 
+#' in the slope being detected at the head of the density distribution curve
+#' @param alpha2 the same as in alpha1 but for the tail of the density distribution curve
+#' @param arcsine_transform Logical, if the data should be transformed 
+#' with arcsine transformation and cofactor 5.
+#' @param ... 
+#' 
+#' @return flow frame with intact cells
+
+gate_intact_cells <- function(flow_frame, 
+                              file_name = NULL,
+                              tinypeak_removal1 = 0.8,
+                              tinypeak_removal2 = 0.8,
+                              alpha1 = 0.05,
+                              alpha2 = 0.1, 
+                              arcsine_transform = TRUE, ...){
+  
+  ff <- flow_frame
+  
+  if (is.null(file_name)){
+    file_name <- ff_test
+  } else {
+    file_name 
+  }
+  
+  if(arcsine_transform == TRUE){
+    
+    ff_t <- flowCore::transform(ff, 
+                                flowCore::transformList(colnames(ff)[grep("Di", colnames(ff))], 
+                                                        CytoNorm::cytofTransform))
+  } else {
+    ff_t <- ff
+  }
+  
+  selection <- matrix(TRUE,
+                      nrow = nrow(ff),
+                      ncol = 1,
+                      dimnames = list(NULL,
+                                      c("intact")))
+  
+  tr <- list()
+  for(m in c("Ir193Di", "Ir191Di")){
+    
+    tr[[m]] <- c(flowDensity::deGate(ff_t, m,
+                                     tinypeak.removal = tinypeak_removal1, 
+                                     upper = FALSE, use.upper = TRUE,
+                                     alpha = alpha1, verbose = F, count.lim = 3, ...), 
+                 flowDensity::deGate(ff_t, m,
+                                     tinypeak.removal = tinypeak_removal2, 
+                                     upper = TRUE, use.upper = TRUE,
+                                     alpha = alpha2, verbose = F, count.lim = 3, ...)) 
+  }
+  
+  for(m in c("Ir193Di", "Ir191Di")){
+    selection[ff_t@exprs[,m] < tr[[m]][1], "intact"] <- FALSE
+    selection[ff_t@exprs[,m] > tr[[m]][2], "intact"] <- FALSE
+  }
+  
+  percentage <- (sum(selection)/length(selection))*100
+  flowDensity::plotDens(ff_t, c("Ir193Di", "Ir191Di"))#, 
+                        #main = paste0(file_name," ( ", format(round(percentage, 2), 
+                         #                                               nsmall = 2), "% )"))
+  
+  abline(h = c(tr[["Ir191Di"]]))
+  abline(v = c(tr[["Ir193Di"]]))
+  points(ff_t@exprs[!selection[,"intact"], c("Ir193Di", "Ir191Di")], pch = ".")
+  
+  ff <- ff[selection[,"intact"], ]
+  
+  return(ff)
+}
+
+
+#' remove_mad_outliers
+#'
+#' @description detects outliers in the selected channel(s) using MAD 
+#' (mean absolute deviation). 
+#'
+#' @param flow_frame 
+#' @param channels character, channel names used for gating, default is set to 
+#' "Event_length"
+#' @param n_mad numeric, how many MAD should be use to detect outliers 
+#' @param mad_f function used to compute deviation, default set to "mad" 
+#' @param plot logicle, if to plot the data, default TRUE
+#' @param center 
+#' @param main character, title of the plot, default set to ""
+#' @param ... other arguments to pass plotDens
+#'
+#' @return matrix with the selected cells 
+remove_mad_outliers <- function(flow_frame, 
+                                channels = "Event_length", 
+                                n_mad = 2,
+                                mad_f = mad,
+                                plot = TRUE,
+                                center = "center",
+                                main = "",
+                                ...){
+  boundaries <- matrix(NA,
+                       nrow = 5,
+                       ncol = length(channels),
+                       dimnames = list(c("median", "center", "mad", "l_lim", "u_lim"),
+                                       channels))
+  for (channel in channels) {
+    x <- flow_frame@exprs[, channel]
+    boundaries["median", channel] <- median(x)
+    boundaries["center", channel] <- density(x)$x[which.max(density(x)$y)]
+    boundaries["mad", channel] <- mad_f(x,
+                                        center = boundaries[center, channel] )
+    boundaries["l_lim", channel] <- boundaries[center, channel] - n_mad * boundaries["mad", channel]
+    boundaries["u_lim", channel] <- boundaries[center, channel] + n_mad * boundaries["mad", channel]
+  }
+  
+  selection <- rep(TRUE, nrow(flow_frame))
+  for (channel in channels) {
+    selection <- selection & (flow_frame@exprs[, channel] > boundaries["l_lim", channel])
+    selection <- selection & (flow_frame@exprs[, channel] < boundaries["u_lim", channel])
+  }
+  percentage <- (sum(selection)/length(selection))*100
+  if (plot) {
+    flowDensity::plotDens(flow_frame, 
+                          c(channels, "Ir191Di"))#, 
+                          #main = paste0(main, " ( ", format(round(percentage, 2), 
+                           #                                 nsmall = 2), "% )"),
+                          #...)
+    if(length(channels) == 2) {
+      points(flow_frame@exprs[!selection, channels], col = "red", pch = ".")
+      abline(v = boundaries[c("l_lim", "u_lim"), channels[1]], col = "grey")
+      abline(h = boundaries[c("l_lim", "u_lim"), channels[2]], col = "grey")
+    } else if(length(channels) == 1) {
+      points(flow_frame@exprs[!selection, c(channels, "Ir191Di")], pch = ".")
+      abline(v = boundaries[c("l_lim", "u_lim"), channels[1]], col = "grey")
+    }
+  }
+  
+  return(selection)
+}
+
+
+#' gate_singlet_cells
+#'
+#' @param flow_frame flow frame
+#' @param channels character, channels name to be used for gating, default is 
+#' to Event_length
+#' @param arcsine_transform Logical, if the data should be transformed with 
+#' arcsine transformation and cofactor 5.
+#' @param file_name Character, the file name used only for plotting, if NULL
+#' the file name stored in keyword GUID.original will be used, default is set to NULL
+#' @param n_mad numeric, number of MADs to detect outliers
+#' @param ... arguments to pass to plotDens
+#'
+#' @return flow frame with singlets 
+gate_singlet_cells <- function(flow_frame, 
+                               channels = "Event_length", 
+                               arcsine_transform = TRUE,
+                               file_name = NULL,
+                               n_mad = 2,
+                               ...){
+  
+  if (is.null(file_name)){
+    file_name <- flow_frame
+  } else {
+    file_name 
+  }
+  
+  if(arcsine_transform == TRUE){
+    
+    flow_frame_t <- flowCore::transform(flow_frame, 
+                                        flowCore::transformList(colnames(flow_frame)[grep("Di", colnames(flow_frame))], 
+                                                                CytoNorm::cytofTransform))
+  } else {
+    flow_frame_t <- flow_frame
+  }
+  
+  selection <- matrix(TRUE,
+                      nrow = nrow(flow_frame),
+                      ncol = 1,
+                      dimnames = list(NULL,
+                                      c("singlets")))  
+  
+  selection[, "singlets"] <- remove_mad_outliers(flow_frame = flow_frame_t, 
+                                                 channels = channels,
+                                                 main = paste("Singlets", file_name),
+                                                 n_mad = n_mad,
+                                                 xlim = c(0, 100), ylim = c(0, 8), ...)
+  
+  flow_frame <- flow_frame[selection[,"singlets"], ]
+  
+  return(flow_frame)
+  
+}
+
+#' gate_live_cells
+#' 
+#' @description Performs gating of live cells using flowDensity package
+#' 
+#' @param flow_frame Character, full path to fcs_file.
+#' @param file_name Character, the file name used only for plotting, if NULL
+#' the file name stored in keyword GUID.original will be used, default is set to NULL
+#' @param viability_channel Character, the channel name used for viability staining
+#' @param tinypeak_removal_viability, numeric from 0-1, as in deGate to exclude/include 
+#' tiny peaks in the tail of the density ditribution curve for both viability channel 
+#' @param tinypeak_removal_Iridium the same as tinypeak_removal_viablity but for
+#' the head and tail of the density ditribution curve in Iridium channel
+#' @param alpha_viability numeric, 0-1, as in deGate specify the significance of change 
+#' in the slope of viability channel
+#' @param alpha_Iridium the same as in alpha_viability but for the Iridium
+#' @param arcsine_transform Logical, if the data should be transformed with 
+#' arcsine transformation and cofactor 5.
+#' @param ... arguments to pass to plotDens function
+#' 
+#' @return flow frame with live cells
+
+gate_live_cells <- function(flow_frame, 
+                            file_name = NULL,
+                            viability_channel,
+                            tinypeak_removal_viability = 0.8,
+                            alpha_viability = 0.1,
+                            tinypeak_removal_Iridium = 0.8,
+                            alpha_Iridium = 0.05,
+                            arcsine_transform = TRUE, ... ){
+  
+  ff <- flow_frame
+  
+  if (is.null(file_name)){
+    file_name <- ff
+  } else {
+    file_name 
+  }
+  
+  if(arcsine_transform == TRUE){
+    
+    ff_t <- flowCore::transform(ff, 
+                                transformList(colnames(ff)[grep("Di", colnames(ff))], 
+                                              CytoNorm::cytofTransform))
+  } else {
+    ff_t <- ff
+  }
+  
+  selection <- matrix(TRUE,
+                      nrow = nrow(ff),
+                      ncol = 1,
+                      dimnames = list(NULL,
+                                      c("live")))
+  
+  
+  v_ch <- grep(viability_channel, colnames(ff), value = T)
+  
+  tr <- list()
+  for(m in c("Ir191Di", v_ch)){
+    if (m == v_ch) {
+      upper = FALSE
+      alpha = alpha_viability
+      tr[[m]] <- flowDensity::deGate(ff_t, m,
+                                     #tinypeak.removal = tinypeak_removal_viability, 
+                                     #upper = upper, use.upper = FALSE,
+                                     #alpha = alpha, verbose = F, count.lim = 3,
+                                     bimodal = TRUE)
+      
+    } else {
+      alpha = alpha_Iridium
+      tr[[m]] <- c(flowDensity::deGate(ff_t, m,
+                                       tinypeak.removal = tinypeak_removal_Iridium, 
+                                       upper = FALSE, use.upper = TRUE,
+                                       alpha = alpha,  verbose = F, count.lim = 3), 
+                   flowDensity::deGate(ff_t, m,
+                                       tinypeak.removal = tinypeak_removal_Iridium, 
+                                       upper = TRUE, use.upper = TRUE,
+                                       alpha = alpha, verbose = F, count.lim = 3)) 
+      
+    }
+  }
+  
+  for(m in c(v_ch, "Ir191Di")){
+    if (m == v_ch) {
+      selection[ff_t@exprs[,m] > tr[[m]][1], "live"] <- FALSE 
+    } else {
+      selection[ff_t@exprs[,m] < tr[[m]][1], "live"] <- FALSE
+      selection[ff_t@exprs[,m] > tr[[m]][2], "live"] <- FALSE  
+    }
+  }
+  percentage <- (sum(selection)/length(selection))*100
+  flowDensity::plotDens(ff_t, c(v_ch, "Ir191Di"), 
+                        #main = paste0(file_name," ( ", format(round(percentage, 2), nsmall = 2), "% )"),
+                        xlim = c(0, 8), ylim = c(0, 8), ...)
+  
+  abline(h = tr[["Ir191Di"]])
+  abline(v = tr[[v_ch]])
+  
+  points(ff_t@exprs[!selection[,"live"], c(v_ch, "Ir191Di")], pch = ".") 
+  
+  ff <- ff[selection[,"live"], ]
+  
+  return(ff)
+  
+}
+
+intact_singlet_live_cells <- function(ff, ff_name){  
+  #dev.off()
+  #par(mfrow = c(12,3))
+  ff <- gate_intact_cells(flow_frame = ff, 
+                          file_name = ff_name)
+  
+  ff <- gate_singlet_cells(flow_frame = ff,
+                           channels = "Event_length",
+                           file_name = ff_name)
+  
+  ff <- gate_live_cells(flow_frame = ff, 
+                        viability_channel = "Pt195Di",
+                        file_name = ff_name)
+}
+
+```
